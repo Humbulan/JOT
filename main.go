@@ -67,8 +67,7 @@ Examples:
     jot add -title "Meeting" -content "Discuss Q3 plans"
     jot list
     jot search -query meeting
-    jot delete -id 3
-`)
+    jot delete -id 3`)
 }
 
 func resolveDBPath(args []string) string {
