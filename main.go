@@ -1,398 +1,287 @@
 package main
 
 import (
-	"database/sql"
-	"flag"
-	"fmt"
-	"log"
-	"os"
-	"time"
+"database/sql"
+"encoding/json"
+"flag"
+"fmt"
+"log"
+"os"
+"path/filepath"
+"text/tabwriter"
+"time"
 
-	_ "modernc.org/sqlite"
+_ "modernc.org/sqlite"
 )
 
-// Note represents a stored note.
-type Note struct {
-	ID        int
-	Title     string
-	Content   string
-	CreatedAt string
-	UpdatedAt string
+func getDBPath() string {
+if dbPath := os.Getenv("JOT_DB"); dbPath != "" {
+return dbPath
 }
-
-var dbFlag string
-
-func init() {
-	const usage = `jot - a SQLite-backed notes CLI
-
-Usage:
-    jot <command> [options]
-
-Commands:
-    add      -title TITLE -content CONTENT  Add a new note
-    list                               List all notes
-    search   -query QUERY              Search notes by title or content
-    delete   -id ID                    Delete a note by ID
-    edit     -id ID [-title TITLE] [-content CONTENT]  Update a note and bump updated_at
-
-Global options:
-    --db PATH          Path to SQLite database (default: jot.db or \$JOT_DB)
-    -h, --help         Show this help
-
-Examples:
-    jot add -title "Meeting" -content "Discuss Q3 plans"
-    jot list
-    jot search -query meeting
-    jot delete -id 3
-    jot edit -id 1 -title "Meeting" -content "Discuss Q4 plans"
-`
-	_ = usage
+home, err := os.UserHomeDir()
+if err == nil {
+dir := filepath.Join(home, ".jot")
+os.MkdirAll(dir, 0755)
+return filepath.Join(dir, "jot.db")
 }
-
-func usage() {
-	fmt.Println(`jot - a SQLite-backed notes CLI
-
-Usage:
-    jot <command> [options]
-
-Commands:
-    add      -title TITLE -content CONTENT  Add a new note
-    list                               List all notes
-    search   -query QUERY              Search notes by title or content
-    delete   -id ID                    Delete a note by ID
-    edit     -id ID [-title TITLE] [-content CONTENT]  Update a note and bump updated_at
-
-Global options:
-    --db PATH          Path to SQLite database (default: jot.db or \$JOT_DB)
-    -h, --help         Show this help
-
-Examples:
-    jot add -title "Meeting" -content "Discuss Q3 plans"
-    jot list
-    jot search -query meeting
-    jot delete -id 3
-    jot edit -id 1 -title "Meeting" -content "Discuss Q4 plans"`)
-}
-
-func resolveDBPath(args []string) string {
-	// Honor --db PATH (must appear before the subcommand), then $JOT_DB, then default.
-	path := ""
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "--db" {
-			path = args[i+1]
-			break
-		}
-	}
-	if path == "" {
-		path = os.Getenv("JOT_DB")
-	}
-	if path == "" {
-		path = "jot.db"
-	}
-	return path
-}
-
-func stripGlobalFlags(args []string) []string {
-	out := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--db" && i+1 < len(args) {
-			i++ // skip the value
-			continue
-		}
-		out = append(out, args[i])
-	}
-	return out
-}
-
-func openDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("ping database: %w", err)
-	}
-	return db, nil
-}
-
-func initDB(db *sql.DB) error {
-	schema := `
-CREATE TABLE IF NOT EXISTS notes (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    title      TEXT    NOT NULL,
-    content    TEXT    NOT NULL,
-    created_at TEXT    NOT NULL,
-    updated_at TEXT    NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_notes_title   ON notes(title);
-CREATE INDEX IF NOT EXISTS idx_notes_content ON notes(content);
-`
-	_, err := db.Exec(schema)
-	return err
-}
-
-func cmdAdd(args []string) error {
-	fs := flag.NewFlagSet("add", flag.ExitOnError)
-	title := fs.String("title", "", "Note title")
-	content := fs.String("content", "", "Note content")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *title == "" || *content == "" {
-		return fmt.Errorf("add requires both -title and -content")
-	}
-
-	db, err := openDB(dbFlag)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	if err := initDB(db); err != nil {
-		return err
-	}
-
-	now := time.Now().Format(time.RFC3339)
-	res, err := db.Exec(
-		`INSERT INTO notes (title, content, created_at, updated_at) VALUES (?, ?, ?, ?)`,
-		*title, *content, now, now,
-	)
-	if err != nil {
-		return fmt.Errorf("insert note: %w", err)
-	}
-	id, _ := res.LastInsertId()
-	fmt.Printf("Added note #%d\n", id)
-	return nil
-}
-
-func cmdList(args []string) error {
-	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	db, err := openDB(dbFlag)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	if err := initDB(db); err != nil {
-		return err
-	}
-
-	rows, err := db.Query(
-		`SELECT id, title, content, created_at, updated_at FROM notes ORDER BY id DESC`,
-	)
-	if err != nil {
-		return fmt.Errorf("query notes: %w", err)
-	}
-	defer rows.Close()
-
-	fmt.Println("ID  Title              Content               Created")
-	fmt.Println("--  -----              -------               -------")
-	count := 0
-	for rows.Next() {
-		var n Note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Content, &n.CreatedAt, &n.UpdatedAt); err != nil {
-			return err
-		}
-		fmt.Printf("%-3d %-18s %-19s %s\n", n.ID, truncate(n.Title, 16), truncate(n.Content, 17), n.CreatedAt[:10])
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if count == 0 {
-		fmt.Println("  (no notes)")
-	}
-	return nil
-}
-
-func cmdSearch(args []string) error {
-	fs := flag.NewFlagSet("search", flag.ExitOnError)
-	query := fs.String("query", "", "Search query")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *query == "" {
-		return fmt.Errorf("search requires -query")
-	}
-
-	db, err := openDB(dbFlag)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	if err := initDB(db); err != nil {
-		return err
-	}
-
-	like := "%" + *query + "%"
-	rows, err := db.Query(
-		`SELECT id, title, content, created_at, updated_at FROM notes
-		 WHERE title LIKE ? OR content LIKE ?
-		 ORDER BY id DESC`,
-		like, like,
-	)
-	if err != nil {
-		return fmt.Errorf("search notes: %w", err)
-	}
-	defer rows.Close()
-
-	fmt.Printf("Search results for %q:\n", *query)
-	fmt.Println("ID  Title              Content               Created")
-	fmt.Println("--  -----              -------               -------")
-	count := 0
-	for rows.Next() {
-		var n Note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Content, &n.CreatedAt, &n.UpdatedAt); err != nil {
-			return err
-		}
-		fmt.Printf("%-3d %-18s %-19s %s\n", n.ID, truncate(n.Title, 16), truncate(n.Content, 17), n.CreatedAt[:10])
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if count == 0 {
-		fmt.Println("  (no matches)")
-	}
-	return nil
-}
-
-func cmdDelete(args []string) error {
-	fs := flag.NewFlagSet("delete", flag.ExitOnError)
-	id := fs.Int("id", 0, "Note ID to delete")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *id == 0 {
-		return fmt.Errorf("delete requires -id")
-	}
-
-	db, err := openDB(dbFlag)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	if err := initDB(db); err != nil {
-		return err
-	}
-
-	res, err := db.Exec(`DELETE FROM notes WHERE id = ?`, *id)
-	if err != nil {
-		return fmt.Errorf("delete note: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		fmt.Printf("No note with id %d\n", *id)
-		return nil
-	}
-	fmt.Printf("Deleted note #%d\n", *id)
-	return nil
-}
-
-func cmdEdit(args []string) error {
-	fs := flag.NewFlagSet("edit", flag.ExitOnError)
-	id := fs.Int("id", 0, "Note ID to edit")
-	title := fs.String("title", "", "New note title")
-	content := fs.String("content", "", "New note content")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *id == 0 {
-		return fmt.Errorf("edit requires -id")
-	}
-	if *title == "" && *content == "" {
-		return fmt.Errorf("edit requires -title and/or -content")
-	}
-
-	db, err := openDB(dbFlag)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	if err := initDB(db); err != nil {
-		return err
-	}
-
-	now := time.Now().Format(time.RFC3339)
-	query := `UPDATE notes SET updated_at = ?`
-	params := []any{now}
-	if *title != "" {
-		query += `, title = ?`
-		params = append(params, *title)
-	}
-	if *content != "" {
-		query += `, content = ?`
-		params = append(params, *content)
-	}
-	query += ` WHERE id = ?`
-	params = append(params, *id)
-
-	res, err := db.Exec(query, params...)
-	if err != nil {
-		return fmt.Errorf("update note: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		fmt.Printf("No note with id %d\n", *id)
-		return nil
-	}
-	fmt.Printf("Updated note #%d\n", *id)
-	return nil
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-1] + "\u2026"
+return "jot.db"
 }
 
 func main() {
-	args := os.Args[1:]
+if len(os.Args) < 2 {
+printHelp()
+os.Exit(1)
+}
 
-	// Handle global help before any subcommand parsing.
-	for _, a := range args {
-		if a == "-h" || a == "--help" || a == "help" {
-			usage()
-			return
-		}
-	}
+db, err := initDB()
+if err != nil {
+log.Fatalf("Failed to initialize database: %v", err)
+}
+defer db.Close()
 
-	if len(args) == 0 {
-		usage()
-		os.Exit(2)
-	}
+cmd := os.Args[1]
+args := os.Args[2:]
 
-	dbFlag = resolveDBPath(args)
-	args = stripGlobalFlags(args)
+switch cmd {
+case "add":
+handleAdd(db, args)
+case "list":
+handleList(db, args)
+case "search":
+handleSearch(db, args)
+case "delete":
+handleDelete(db, args)
+case "edit":
+handleEdit(db, args)
+case "export":
+handleExport(db, args)
+case "--help", "-h", "help":
+printHelp()
+default:
+fmt.Printf("Unknown command: %s\n\n", cmd)
+printHelp()
+os.Exit(1)
+}
+}
 
-	switch args[0] {
-	case "add":
-		if err := cmdAdd(args[1:]); err != nil {
-			log.Fatal(err)
-		}
-	case "list":
-		if err := cmdList(args[1:]); err != nil {
-			log.Fatal(err)
-		}
-	case "search":
-		if err := cmdSearch(args[1:]); err != nil {
-			log.Fatal(err)
-		}
-	case "delete":
-		if err := cmdDelete(args[1:]); err != nil {
-			log.Fatal(err)
-		}
-	case "edit":
-		if err := cmdEdit(args[1:]); err != nil {
-			log.Fatal(err)
-		}
-	default:
-		fmt.Printf("Unknown command: %s\n\n", args[0])
-		usage()
-		os.Exit(2)
-	}
+func initDB() (*sql.DB, error) {
+db, err := sql.Open("sqlite", getDBPath())
+if err != nil {
+return nil, err
+}
+// Added updated_at to preserve the edit command logic
+query := `
+CREATE TABLE IF NOT EXISTS notes (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+title TEXT NOT NULL,
+content TEXT NOT NULL,
+tag TEXT DEFAULT 'general',
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`
+_, err = db.Exec(query)
+return db, err
+}
+
+func handleAdd(db *sql.DB, args []string) {
+fs := flag.NewFlagSet("add", flag.ExitOnError)
+title := fs.String("title", "", "Note title")
+content := fs.String("content", "", "Note content")
+tag := fs.String("tag", "general", "Note category/tag")
+fs.Parse(args)
+
+if *title == "" || *content == "" {
+fmt.Println("Error: --title and --content are required.")
+fmt.Println("Usage: jot add --title 'Title' --content 'Content' [--tag 'tag']")
+os.Exit(1)
+}
+
+_, err := db.Exec("INSERT INTO notes (title, content, tag) VALUES (?, ?, ?)", *title, *content, *tag)
+if err != nil {
+log.Fatalf("Failed to add note: %v", err)
+}
+fmt.Println("Note added successfully.")
+}
+
+func handleList(db *sql.DB, args []string) {
+fs := flag.NewFlagSet("list", flag.ExitOnError)
+filterTag := fs.String("tag", "", "Filter by tag")
+fs.Parse(args)
+
+var rows *sql.Rows
+var err error
+if *filterTag != "" {
+rows, err = db.Query("SELECT id, title, content, tag, created_at FROM notes WHERE tag = ? ORDER BY created_at DESC", *filterTag)
+} else {
+rows, err = db.Query("SELECT id, title, content, tag, created_at FROM notes ORDER BY created_at DESC")
+}
+if err != nil {
+log.Fatalf("Failed to query notes: %v", err)
+}
+defer rows.Close()
+
+w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+fmt.Fprintln(w, "ID\tTAG\tTITLE\tCREATED\tCONTENT")
+fmt.Fprintln(w, "--\t---\t-----\t-------\t-------")
+
+hasNotes := false
+for rows.Next() {
+hasNotes = true
+var id int
+var title, content, tag, createdAt string
+if err := rows.Scan(&id, &title, &content, &tag, &createdAt); err != nil {
+continue
+}
+if len(content) > 35 {
+content = content[:32] + "..."
+}
+fmt.Fprintf(w, "%d\t[%s]\t%s\t%s\t%s\n", id, tag, title, createdAt, content)
+}
+w.Flush()
+if !hasNotes {
+fmt.Println("No notes found.")
+}
+}
+
+func handleSearch(db *sql.DB, args []string) {
+fs := flag.NewFlagSet("search", flag.ExitOnError)
+query := fs.String("query", "", "Search term")
+fs.Parse(args)
+
+if *query == "" {
+fmt.Println("Usage: jot search --query <term>")
+os.Exit(1)
+}
+
+term := "%" + *query + "%"
+rows, err := db.Query("SELECT id, title, content, tag, created_at FROM notes WHERE title LIKE ? OR content LIKE ? OR tag LIKE ? ORDER BY created_at DESC", term, term, term)
+if err != nil {
+log.Fatalf("Failed to search notes: %v", err)
+}
+defer rows.Close()
+
+w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+fmt.Fprintln(w, "ID\tTAG\tTITLE\tCREATED\tCONTENT")
+fmt.Fprintln(w, "--\t---\t-----\t-------\t-------")
+
+hasNotes := false
+for rows.Next() {
+hasNotes = true
+var id int
+var title, content, tag, createdAt string
+if err := rows.Scan(&id, &title, &content, &tag, &createdAt); err != nil {
+continue
+}
+fmt.Fprintf(w, "%d\t[%s]\t%s\t%s\t%s\n", id, tag, title, createdAt, content)
+}
+w.Flush()
+if !hasNotes {
+fmt.Println("No matching notes found.")
+}
+}
+
+func handleDelete(db *sql.DB, args []string) {
+fs := flag.NewFlagSet("delete", flag.ExitOnError)
+id := fs.String("id", "", "Note ID to delete")
+fs.Parse(args)
+
+if *id == "" {
+fmt.Println("Usage: jot delete --id <id>")
+os.Exit(1)
+}
+
+res, err := db.Exec("DELETE FROM notes WHERE id = ?", *id)
+if err != nil {
+log.Fatalf("Failed to delete note: %v", err)
+}
+rowsAffected, _ := res.RowsAffected()
+if rowsAffected == 0 {
+fmt.Printf("Note with ID %s not found.\n", *id)
+} else {
+fmt.Printf("Note %s deleted successfully.\n", *id)
+}
+}
+
+func handleEdit(db *sql.DB, args []string) {
+fs := flag.NewFlagSet("edit", flag.ExitOnError)
+id := fs.Int("id", 0, "Note ID to edit")
+title := fs.String("title", "", "New title")
+content := fs.String("content", "", "New content")
+fs.Parse(args)
+
+if *id == 0 {
+fmt.Println("Usage: jot edit -id <id> [-title <title>] [-content <content>]")
+os.Exit(1)
+}
+
+query := "UPDATE notes SET updated_at = ?"
+params := []interface{}{time.Now().Format(time.RFC3339)}
+
+if *title != "" {
+query += ", title = ?"
+params = append(params, *title)
+}
+if *content != "" {
+query += ", content = ?"
+params = append(params, *content)
+}
+
+if len(params) == 1 {
+fmt.Println("Error: must provide -title and/or -content")
+os.Exit(1)
+}
+
+query += " WHERE id = ?"
+params = append(params, *id)
+
+res, err := db.Exec(query, params...)
+if err != nil {
+log.Fatalf("Failed to update note: %v", err)
+}
+
+rowsAffected, _ := res.RowsAffected()
+if rowsAffected == 0 {
+fmt.Printf("No note with id %d\n", *id)
+} else {
+fmt.Printf("Updated note #%d\n", *id)
+}
+}
+
+func handleExport(db *sql.DB, args []string) {
+rows, err := db.Query("SELECT id, title, content, tag, created_at FROM notes ORDER BY created_at DESC")
+if err != nil {
+log.Fatalf("Failed to export notes: %v", err)
+}
+defer rows.Close()
+
+type Note struct {
+ID        int    `json:"id"`
+Title     string `json:"title"`
+Content   string `json:"content"`
+Tag       string `json:"tag"`
+CreatedAt string `json:"created_at"`
+}
+
+var notes []Note
+for rows.Next() {
+var n Note
+rows.Scan(&n.ID, &n.Title, &n.Content, &n.Tag, &n.CreatedAt)
+notes = append(notes, n)
+}
+
+data, _ := json.MarshalIndent(notes, "", "  ")
+fmt.Println(string(data))
+}
+
+func printHelp() {
+fmt.Println("jot - A pure-Go SQLite Notes & Audit CLI")
+fmt.Println("\nUsage:")
+fmt.Println("  jot <command> [options]")
+fmt.Println("\nCommands:")
+fmt.Println("  add     --title TITLE --content CONTENT [--tag TAG]  Add note")
+fmt.Println("  list    [--tag TAG]                                  List notes")
+fmt.Println("  search  --query QUERY                                Search notes")
+fmt.Println("  delete  --id ID                                      Delete note")
+fmt.Println("  edit    --id ID [--title TITLE] [--content CONTENT]  Edit note")
+fmt.Println("  export                                               Export notes as JSON")
 }
