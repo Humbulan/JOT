@@ -12,6 +12,7 @@ so there is **no CGO** and no C compiler is required.
 | `jot list` | List all notes (newest first) |
 | `jot search -query Q` | Search notes by title or content |
 | `jot delete -id N` | Delete a note by ID |
+| `jot edit -id N [-title T] [-content C]` | Update a note's title and/or content; bumps `updated_at` |
 | `jot --help` | Show help |
 
 ## Database location

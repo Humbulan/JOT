@@ -1,12 +1,14 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // setDBPath points the package-level dbFlag at a fresh SQLite database inside
@@ -48,6 +50,8 @@ func runJotCommand(t *testing.T, dbPath, command string, args ...string) (string
 		cmdErr = cmdSearch(cmdArgs[1:])
 	case "delete":
 		cmdErr = cmdDelete(cmdArgs[1:])
+	case "edit":
+		cmdErr = cmdEdit(cmdArgs[1:])
 	default:
 		cmdErr = fmt.Errorf("unknown command: %s", command)
 	}
@@ -73,6 +77,21 @@ func addNote(t *testing.T, dbPath string, title, content string) {
 	if _, _, err := runJotCommand(t, dbPath, "add", noteArgs(title, content)...); err != nil {
 		t.Fatalf("setup add failed: %v", err)
 	}
+}
+
+// noteUpdatedAt queries the database directly for a note's updated_at timestamp.
+func noteUpdatedAt(t *testing.T, dbPath string, id int) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer db.Close()
+	var updatedAt string
+	if err := db.QueryRow(`SELECT updated_at FROM notes WHERE id = ?`, id).Scan(&updatedAt); err != nil {
+		t.Fatalf("query updated_at: %v", err)
+	}
+	return updatedAt
 }
 
 func TestAdd(t *testing.T) {
@@ -359,6 +378,137 @@ func TestDelete(t *testing.T) {
 			for _, s := range tt.wantNotContains {
 				if strings.Contains(listOut, s) {
 					t.Errorf("expected list output to not contain %q, got:\n%s", s, listOut)
+				}
+			}
+		})
+	}
+}
+
+func TestEdit(t *testing.T) {
+	tests := []struct {
+		name            string
+		preAdd          [][]string
+		args            []string
+		wantErr         string
+		wantOut         string
+		wantContains    []string
+		wantNotContains []string
+		wantUpdatedAt   bool // assert updated_at changed after the edit
+	}{
+		{
+			name:            "updates title and content",
+			preAdd:          [][]string{noteArgs("Old Title", "Old content")},
+			args:            []string{"-id", "1", "-title", "New Title", "-content", "New content"},
+			wantOut:         "Updated note #1",
+			wantContains:    []string{"New Title", "New content"},
+			wantNotContains: []string{"Old Title", "Old content"},
+			wantUpdatedAt:   true,
+		},
+		{
+			name:            "updates only title",
+			preAdd:          [][]string{noteArgs("Keep Content", "original content")},
+			args:            []string{"-id", "1", "-title", "New Title Only"},
+			wantOut:         "Updated note #1",
+			wantContains:    []string{"New Title Only", "original content"},
+			wantNotContains: []string{"Keep Content"},
+			wantUpdatedAt:   true,
+		},
+		{
+			name:            "updates only content",
+			preAdd:          [][]string{noteArgs("Keep Title", "original content")},
+			args:            []string{"-id", "1", "-content", "new content only"},
+			wantOut:         "Updated note #1",
+			wantContains:    []string{"Keep Title", "new content only"},
+			wantNotContains: []string{"original content"},
+			wantUpdatedAt:   true,
+		},
+		{
+			name:          "bumps updated_at to a later RFC3339 timestamp",
+			preAdd:        [][]string{noteArgs("Timed", "original")},
+			args:          []string{"-id", "1", "-content", "updated later"},
+			wantOut:       "Updated note #1",
+			wantUpdatedAt: true,
+		},
+		{
+			name:         "editing nonexistent id reports no note",
+			preAdd:       [][]string{noteArgs("Solo", "only one")},
+			args:         []string{"-id", "99", "-title", "Nope"},
+			wantOut:      "No note with id 99",
+			wantContains: []string{"Solo"},
+		},
+		{
+			name:    "missing id",
+			args:    []string{"-title", "T"},
+			wantErr: "edit requires -id",
+		},
+		{
+			name:    "no fields to update",
+			args:    []string{"-id", "1"},
+			wantErr: "edit requires -title and/or -content",
+		},
+		{
+			name:    "no args at all",
+			args:    []string{},
+			wantErr: "edit requires -id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dbPath := setDBPath(t)
+
+			for _, args := range tt.preAdd {
+				if _, _, err := runJotCommand(t, dbPath, "add", args...); err != nil {
+					t.Fatalf("setup add failed: %v", err)
+				}
+			}
+
+			var before string
+			if tt.wantUpdatedAt {
+				before = noteUpdatedAt(t, dbPath, 1)
+				// updated_at is stored at second precision, so ensure the
+				// edit lands in a later second.
+				time.Sleep(time.Second + 500*time.Millisecond)
+			}
+
+			out, _, err := runJotCommand(t, dbPath, "edit", tt.args...)
+
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error %q, got %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("edit failed: %v", err)
+			}
+			if tt.wantOut != "" && !strings.Contains(out, tt.wantOut) {
+				t.Errorf("expected output to contain %q, got:\n%s", tt.wantOut, out)
+			}
+
+			// List to verify the edit persisted.
+			listOut, _, err := runJotCommand(t, dbPath, "list")
+			if err != nil {
+				t.Fatalf("list after edit failed: %v", err)
+			}
+			for _, s := range tt.wantContains {
+				if !strings.Contains(listOut, s) {
+					t.Errorf("expected list output to contain %q, got:\n%s", s, listOut)
+				}
+			}
+			for _, s := range tt.wantNotContains {
+				if strings.Contains(listOut, s) {
+					t.Errorf("expected list output to not contain %q, got:\n%s", s, listOut)
+				}
+			}
+
+			if tt.wantUpdatedAt {
+				after := noteUpdatedAt(t, dbPath, 1)
+				if after == before {
+					t.Errorf("expected updated_at to change after edit, got %q both times", after)
+				}
+				if _, err := time.Parse(time.RFC3339, after); err != nil {
+					t.Errorf("updated_at %q is not valid RFC3339: %v", after, err)
 				}
 			}
 		})

@@ -33,6 +33,7 @@ Commands:
     list                               List all notes
     search   -query QUERY              Search notes by title or content
     delete   -id ID                    Delete a note by ID
+    edit     -id ID [-title TITLE] [-content CONTENT]  Update a note and bump updated_at
 
 Global options:
     --db PATH          Path to SQLite database (default: jot.db or \$JOT_DB)
@@ -43,6 +44,7 @@ Examples:
     jot list
     jot search -query meeting
     jot delete -id 3
+    jot edit -id 1 -title "Meeting" -content "Discuss Q4 plans"
 `
 	_ = usage
 }
@@ -58,6 +60,7 @@ Commands:
     list                               List all notes
     search   -query QUERY              Search notes by title or content
     delete   -id ID                    Delete a note by ID
+    edit     -id ID [-title TITLE] [-content CONTENT]  Update a note and bump updated_at
 
 Global options:
     --db PATH          Path to SQLite database (default: jot.db or \$JOT_DB)
@@ -67,7 +70,8 @@ Examples:
     jot add -title "Meeting" -content "Discuss Q3 plans"
     jot list
     jot search -query meeting
-    jot delete -id 3`)
+    jot delete -id 3
+    jot edit -id 1 -title "Meeting" -content "Discuss Q4 plans"`)
 }
 
 func resolveDBPath(args []string) string {
@@ -288,6 +292,57 @@ func cmdDelete(args []string) error {
 	return nil
 }
 
+func cmdEdit(args []string) error {
+	fs := flag.NewFlagSet("edit", flag.ExitOnError)
+	id := fs.Int("id", 0, "Note ID to edit")
+	title := fs.String("title", "", "New note title")
+	content := fs.String("content", "", "New note content")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *id == 0 {
+		return fmt.Errorf("edit requires -id")
+	}
+	if *title == "" && *content == "" {
+		return fmt.Errorf("edit requires -title and/or -content")
+	}
+
+	db, err := openDB(dbFlag)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := initDB(db); err != nil {
+		return err
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	query := `UPDATE notes SET updated_at = ?`
+	params := []any{now}
+	if *title != "" {
+		query += `, title = ?`
+		params = append(params, *title)
+	}
+	if *content != "" {
+		query += `, content = ?`
+		params = append(params, *content)
+	}
+	query += ` WHERE id = ?`
+	params = append(params, *id)
+
+	res, err := db.Exec(query, params...)
+	if err != nil {
+		return fmt.Errorf("update note: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		fmt.Printf("No note with id %d\n", *id)
+		return nil
+	}
+	fmt.Printf("Updated note #%d\n", *id)
+	return nil
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -329,6 +384,10 @@ func main() {
 		}
 	case "delete":
 		if err := cmdDelete(args[1:]); err != nil {
+			log.Fatal(err)
+		}
+	case "edit":
+		if err := cmdEdit(args[1:]); err != nil {
 			log.Fatal(err)
 		}
 	default:
